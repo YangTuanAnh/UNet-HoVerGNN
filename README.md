@@ -36,6 +36,11 @@ Example usage:
 
 ```sh
 cd src
+python -m venv .venv
+source .venv/bin/activate
+# ".venv/Scripts/activate" (Windows)
+pip install -r requirements.txt
+
 python main.py --dataset MoNuSAC --num_classes 5 \
                --data_path /path/to/data \
                --output_path /path/to/output
@@ -43,7 +48,7 @@ python main.py --dataset MoNuSAC --num_classes 5 \
 python main.py --dataset PanNuke --num_classes 6 \
                --data_path /path/to/data \
                --output_path /path/to/output
-               
+
 python main.py --dataset CoNSeP_Tiled --num_classes 8 \
                --data_path /path/to/data \
                --output_path /path/to/output
