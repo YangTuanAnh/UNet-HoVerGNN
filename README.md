@@ -9,6 +9,7 @@
 We present **UNet-HoVerGNN**, a unified framework that enhances nuclei instance segmentation and classification by combining convolutional visual encoding with graph-based reasoning. Built on a U-Net backbone with a ResNet-34 encoder, our model extracts rich visual features, constructs \$k\$-nearest neighbor graphs over detected nuclei, and applies a graph neural network to model inter-nuclear relationships. Node and edge features are extracted via bilinear sampling and positional encodings from the shared encoder. Evaluated on three histopathology benchmarks—MoNuSAC, PanNuke, and CoNSeP—our approach consistently outperforms or matches state-of-the-art methods in Aggregated Jaccard Index (AJI), F1-score, and Panoptic Quality (PQ). The code and trained models are available at:
 **[GitHub Repository](https://github.com/YangTuanAnh/UNet-HoVerGNN)**
 **[Dataset on Kaggle](https://www.kaggle.com/datasets/yangtunanh/monusac-pannuke-consep/data)**
+**[Models on Kaggle](https://www.kaggle.com/models/yangtunanh/hovergnn-monusac/)**
 
 ---
 
