@@ -28,6 +28,26 @@ Supported datasets:
 * **CoNSeP**: Colorectal cancer nuclei segmentation.
 
 ---
+## Training and Evaluation
+
+To train and evaluate the UNet-HoVerGNN model, navigate to the src directory and run the main.py script with the desired dataset and number of classes. Command-line arguments --dataset and --num_classes override the default values specified in config.py.
+
+Example usage:
+
+```py
+cd src
+python main.py --dataset MoNuSAC --num_classes 5 \
+               --data_path /path/to/data \
+               --output_path /path/to/output
+               
+# python main.py --dataset PanNuke --num_classes 6 \
+#                --data_path /path/to/data \
+#                --output_path /path/to/output
+# python main.py --dataset CoNSeP_Tiled --num_classes 8 \
+#                --data_path /path/to/data \
+#                --output_path /path/to/output
+```
+---
 
 ## Performance Comparison
 
