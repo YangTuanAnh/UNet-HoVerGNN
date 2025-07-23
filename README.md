@@ -10,7 +10,7 @@ We present **UNet-HoVerGNN**, a unified framework that enhances nuclei instance 
 **[GitHub Repository](https://github.com/YangTuanAnh/UNet-HoVerGNN)**
 **[Dataset on Kaggle](https://www.kaggle.com/datasets/yangtunanh/monusac-pannuke-consep/data)**
 **[Models on Kaggle](https://www.kaggle.com/models/yangtunanh/hovergnn-monusac/)**
-
+**[Reproduced experiments](https://www.kaggle.com/code/yangtunanh/unet-hovergnn-reproducibility)**
 ---
 
 ## Dataset Setup
