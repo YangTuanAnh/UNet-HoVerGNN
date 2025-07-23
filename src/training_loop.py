@@ -218,12 +218,13 @@ def train(model, criterion, train_loader, val_loader, device,
             if val_pq > best_val_pq:
                 best_val_pq = val_pq
                 epochs_no_improve = 0
-                torch.save(model.state_dict(), f"best_hovernet_{stage_name}.pt")
-                print("Saved best model (based on PQ).")
+                best_model_path = os.path.join(Config.OUTPUT_PATH, f"best_hovernet_{stage_name}.pt")
+                torch.save(model.state_dict(), best_model_path)
+                print(f"Saved best model (based on PQ) to {best_model_path}.")
             else:
                 epochs_no_improve += 1
                 print(f"No improvement in PQ for {epochs_no_improve} epoch(s).")
-    
+
             if epochs_no_improve >= patience:
                 print(f"Early stopping triggered after {patience} epochs with no improvement in PQ.")
                 break
