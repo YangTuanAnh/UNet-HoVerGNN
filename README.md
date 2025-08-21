@@ -1,5 +1,7 @@
 # UNet-HoVerGNN: Structured Graph Integration into HoVerNet for Enhanced Nuclei Segmentation and Classification
 
+**Update:** This work has been accepted for presentation and publishing on 2025 International Conference on Machine Vision (ICMV 2025)! 🎉
+
 ![Framework Overview](diagram.png)
 
 ---
