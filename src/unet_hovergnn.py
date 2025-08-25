@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import segmentation_models_pytorch as smp
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
 
-from torch_geometric.nn import GENConv, LayerNorm, Linear
+from torch_geometric.nn import GATv2Conv, LayerNorm, Linear
 
 def get_sinusoidal_encoding(coords, num_freqs=64):
     """
@@ -28,21 +27,22 @@ def get_sinusoidal_encoding(coords, num_freqs=64):
     return torch.cat([sin_cos_y, sin_cos_x], dim=1)  # [N, 4 * num_freqs]
 
 class GraphBranch(nn.Module):
-    """Node-level GNN classifier using 3-layer GENConv with edge_attr"""
+    """Node-level GNN classifier using multi-layer GATv2 with edge_attr support."""
     def __init__(self, in_channels=512, hidden_channels=128, edge_dim=256, num_layers=3, num_classes=5, dropout=0.1):
         super().__init__()
 
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
-        self.convs.append(GENConv(in_channels, hidden_channels, edge_dim=edge_dim))
+        # Use single-head GATv2Conv layers to preserve channel sizes and support edge_attr
+        self.convs.append(GATv2Conv(in_channels, hidden_channels, heads=1, concat=True, edge_dim=edge_dim))
         self.norms.append(LayerNorm(hidden_channels))
 
         for _ in range(num_layers - 2):
-            self.convs.append(GENConv(hidden_channels, hidden_channels, edge_dim=edge_dim))
+            self.convs.append(GATv2Conv(hidden_channels, hidden_channels, heads=1, concat=True, edge_dim=edge_dim))
             self.norms.append(LayerNorm(hidden_channels))
 
-        self.convs.append(GENConv(hidden_channels, hidden_channels, edge_dim=edge_dim))
+        self.convs.append(GATv2Conv(hidden_channels, hidden_channels, heads=1, concat=True, edge_dim=edge_dim))
         self.norms.append(LayerNorm(hidden_channels))
 
         self.classifier = nn.Sequential(
@@ -60,7 +60,7 @@ class GraphBranch(nn.Module):
         x = self.norms[0](x)
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
-        
+
         for i in range(1, len(self.convs) - 1):
             residual = x
             x = self.convs[i](x, edge_index, edge_attr)
@@ -75,51 +75,207 @@ class GraphBranch(nn.Module):
         node_pred = self.classifier(x)
         return node_pred, x  # logits, final embeddings
 
+class ViTEncoder(nn.Module):
+    """
+    ViT-style encoder with 4 transformer stages producing hierarchical feature maps.
+    Each stage downsamples by 2 (via strided conv) and applies 1 TransformerEncoder layer.
+    Returns a list: [input_image, stage1, stage2, stage3, stage4]
+    """
+    def __init__(self, in_channels: int = 3, embed_dims: list[int] | None = None,
+                 num_heads: list[int] | None = None, mlp_ratio: float = 4.0, dropout: float = 0.1):
+        super().__init__()
+        if embed_dims is None:
+            embed_dims = [128, 192, 256, 256]
+        if num_heads is None:
+            num_heads = [4, 6, 8, 8]
+
+        assert len(embed_dims) == 4 and len(num_heads) == 4, "ViTEncoder expects 4 stages"
+
+        self.in_channels = in_channels
+        self.embed_dims = embed_dims
+
+        self.proj_convs = nn.ModuleList()
+        self.transformers = nn.ModuleList()
+        self.pos_projs = nn.ModuleList()
+
+        prev_c = in_channels
+        for dim, heads in zip(embed_dims, num_heads):
+            # Downsample and project channels
+            self.proj_convs.append(nn.Conv2d(prev_c, dim, kernel_size=3, stride=2, padding=1))
+
+            layer = nn.TransformerEncoderLayer(
+                d_model=dim,
+                nhead=heads,
+                dim_feedforward=int(dim * mlp_ratio),
+                dropout=dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.transformers.append(nn.TransformerEncoder(layer, num_layers=1))
+            self.pos_projs.append(Linear(32, dim))
+            prev_c = dim
+
+        # Expose channels for heads
+        self.out_channels = [in_channels] + embed_dims
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        feats = [x]
+        cur = x
+        B = x.shape[0]
+        device = x.device
+        for proj, tr, pos_lin in zip(self.proj_convs, self.transformers, self.pos_projs):
+            cur = proj(cur)
+            B_, C, H, W = cur.shape
+            tokens = cur.flatten(2).transpose(1, 2)  # [B, N, C]
+            yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+            coords = torch.stack([yy.reshape(-1), xx.reshape(-1)], dim=1).to(torch.long)
+            pos = get_sinusoidal_encoding(coords, num_freqs=8)  # [N, 32]
+            pos = pos_lin(pos).unsqueeze(0).expand(B_, -1, -1)
+            tokens = tr(tokens + pos)
+            cur = tokens.transpose(1, 2).reshape(B_, C, H, W)
+            feats.append(cur)
+        return feats
+
+class UNetSegHead(nn.Module):
+    """
+    CNN-based UNet decoder head that consumes encoder pyramid [input, s1..s4].
+    Fuses deepest->shallowest with skip connections, then fuses with input skip.
+    """
+    def __init__(self, encoder_channels: list[int], num_classes: int, embed_dim: int = 256):
+        super().__init__()
+        assert len(encoder_channels) >= 5, "Expect [input, s1, s2, s3, s4] from encoder"
+
+        self.num_classes = num_classes
+
+        # Channels at each encoder stage
+        c0, c1, c2, c3, c4 = encoder_channels[:5]
+
+        # Decoder channels per upsampling step (from deep to shallow)
+        decoder_channels = [embed_dim, max(embed_dim // 2, 96), max(embed_dim // 4, 64)]
+
+        # Blocks: s4 -> s3, s3 -> s2, s2 -> s1
+        self.block1 = nn.Sequential(
+            nn.Conv2d(c4, decoder_channels[0], kernel_size=3, padding=1),
+            nn.BatchNorm2d(decoder_channels[0]),
+            nn.GELU(),
+        )
+
+        self.block2 = nn.Sequential(
+            nn.Conv2d(decoder_channels[0] + c3, decoder_channels[1], kernel_size=3, padding=1),
+            nn.BatchNorm2d(decoder_channels[1]),
+            nn.GELU(),
+            nn.Conv2d(decoder_channels[1], decoder_channels[1], kernel_size=3, padding=1),
+            nn.BatchNorm2d(decoder_channels[1]),
+            nn.GELU(),
+        )
+
+        self.block3 = nn.Sequential(
+            nn.Conv2d(decoder_channels[1] + c2, decoder_channels[2], kernel_size=3, padding=1),
+            nn.BatchNorm2d(decoder_channels[2]),
+            nn.GELU(),
+            nn.Conv2d(decoder_channels[2], decoder_channels[2], kernel_size=3, padding=1),
+            nn.BatchNorm2d(decoder_channels[2]),
+            nn.GELU(),
+        )
+
+        # After reaching s1, fuse with s1 skip
+        self.block4 = nn.Sequential(
+            nn.Conv2d(decoder_channels[2] + c1, decoder_channels[2], kernel_size=3, padding=1),
+            nn.BatchNorm2d(decoder_channels[2]),
+            nn.GELU(),
+        )
+
+        # Input skip projection and final fuse
+        self.input_proj = nn.Conv2d(c0, decoder_channels[2], kernel_size=1)
+        self.final_fuse = nn.Sequential(
+            nn.Conv2d(decoder_channels[2] + decoder_channels[2], decoder_channels[2], kernel_size=3, padding=1),
+            nn.BatchNorm2d(decoder_channels[2]),
+            nn.GELU(),
+        )
+
+        self.seg_head = nn.Conv2d(decoder_channels[2], num_classes, kernel_size=1)
+
+    def forward(self, encoder_feats: list[torch.Tensor], input_spatial_size: tuple[int, int]) -> torch.Tensor:
+        B = encoder_feats[0].shape[0]
+        H, W = input_spatial_size
+
+        x0, x1, x2, x3, x4 = encoder_feats[:5]
+
+        # Start from deepest
+        x = self.block1(x4)
+        x = F.interpolate(x, size=x3.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, x3], dim=1)
+        x = self.block2(x)
+
+        x = F.interpolate(x, size=x2.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, x2], dim=1)
+        x = self.block3(x)
+
+        x = F.interpolate(x, size=x1.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, x1], dim=1)
+        x = self.block4(x)
+
+        # Fuse with input skip
+        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+        input_feat = self.input_proj(x0)
+        input_feat = F.interpolate(input_feat, size=(H, W), mode='bilinear', align_corners=False)
+        x = torch.cat([x, input_feat], dim=1)
+        x = self.final_fuse(x)
+
+        logits = self.seg_head(x)
+        return logits
+
 class GraphHoverNet(nn.Module):
-    def __init__(self, num_classes=6, encoder_name='resnet34', encoder_weights='imagenet', 
-                 use_graph=True, k_neighbors=8, graph_feature_dim=288):
+    def __init__(self, num_classes=6, use_graph=True, k_neighbors=8):
         super().__init__()
         self.use_graph = use_graph
         self.k_neighbors = k_neighbors
 
-        # Shared encoder
-        self.shared_encoder = smp.encoders.get_encoder(encoder_name, in_channels=3, depth=5, weights=encoder_weights)
+        # Shared ViT encoder (4 stages)
+        self.encoder = ViTEncoder(in_channels=3)
+        self.encoder_channels = list(self.encoder.out_channels)
 
-        # Use shared encoder in all heads
-        self.model_np = smp.Unet(encoder_name=encoder_name, encoder_weights=None,
-                                         in_channels=3, classes=2, activation=None)
-        self.model_hv = smp.Unet(encoder_name=encoder_name, encoder_weights=None,
-                                         in_channels=3, classes=2, activation=None)
-        self.model_nc = smp.Unet(encoder_name=encoder_name, encoder_weights=None,
-                                         in_channels=3, classes=num_classes, activation=None)
+        # Graph uses the -2 stage (s3)
+        self.feature_stage_index = -2
+        self.feature_channels = int(self.encoder_channels[self.feature_stage_index])
 
-        self.model_np.encoder = self.shared_encoder
-        self.model_hv.encoder = self.shared_encoder
-        self.model_nc.encoder = self.shared_encoder
+        # CNN-based UNet decoder heads for NP, HV, and NC tasks
+        self.head_np = UNetSegHead(encoder_channels=self.encoder_channels, num_classes=2, embed_dim=256)
+        self.head_hv = UNetSegHead(encoder_channels=self.encoder_channels, num_classes=2, embed_dim=256)
+        self.head_nc = UNetSegHead(encoder_channels=self.encoder_channels, num_classes=num_classes, embed_dim=256)
 
         if self.use_graph:
-            self.graph_branch = GraphBranch(in_channels=graph_feature_dim,
+            # Graph in_channels = feature_channels + positional_dim (32)
+            computed_graph_in = self.feature_channels + 32
+            self.graph_branch = GraphBranch(in_channels=computed_graph_in,
+                                            hidden_channels=128,
+                                            edge_dim=self.feature_channels,
                                             num_layers=2, num_classes=num_classes)
 
     def set_stage(self, stage):
         if stage == 'pretrain':
             self.use_graph = False
 
-            for m in [self.model_np, self.model_hv, self.model_nc]:
-                    for p in m.parameters():
-                        p.requires_grad = True
+            # Train ViT encoder and CNN decoders
+            for p in self.encoder.parameters():
+                p.requires_grad = True
+            for m in [self.head_np, self.head_hv, self.head_nc]:
+                for p in m.parameters():
+                    p.requires_grad = True
 
         elif stage == 'finetune':
             self.use_graph = True
 
-            for p in self.shared_encoder.parameters():
+            # Freeze ViT encoder, finetune decoder heads and graph branch
+            for p in self.encoder.parameters():
                 p.requires_grad = False
 
-            # Unfreeze everything else
-            for m in [self.model_np.decoder, self.model_np.segmentation_head,
-                      self.model_hv.decoder, self.model_hv.segmentation_head,
-                      self.model_nc.decoder, self.model_nc.segmentation_head,
-                      self.graph_branch]:
+            modules_to_train = [self.head_np, self.head_hv, self.head_nc]
+            if hasattr(self, 'graph_branch'):
+                modules_to_train.append(self.graph_branch)
+
+            for m in modules_to_train:
                 for p in m.parameters():
                     p.requires_grad = True
                     
@@ -166,16 +322,21 @@ class GraphHoverNet(nn.Module):
 
     def forward(self, x):
         batch_size = x.shape[0]
-        out_np = self.model_np(x)
-        out_hv = self.model_hv(x)
-        out_nc = self.model_nc(x)
+
+        # Run ViT encoder once
+        encoder_feats = self.encoder(x)
+        feat = encoder_feats[self.feature_stage_index]  # [B, C, Hf, Wf]
+
+        # CNN UNet-style decoder heads
+        out_np = self.head_np(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
+        out_hv = self.head_hv(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
+        out_nc = self.head_nc(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
+
         if not self.use_graph:
             return out_np, out_hv, out_nc, None, None
 
         out_gc = None
-        graph_enhanced_nc = out_nc.clone()
-        encoder_feats = self.shared_encoder(x)
-        encoder_features = F.interpolate(encoder_feats[-2], size=(255, 255), mode="bilinear", align_corners=False)
+        encoder_features = F.interpolate(feat, size=(255, 255), mode="bilinear", align_corners=False)
 
         all_centroids = []
         all_out_gc = []
@@ -202,7 +363,7 @@ class GraphHoverNet(nn.Module):
             mid[:, 0] = mid[:, 0].clamp(0, 254)
             mid[:, 1] = mid[:, 1].clamp(0, 254)
             
-            # Edge attributes from midpoints
+            # Edge attributes from midpoints (use feature channels)
             edge_attr = encoder_features[b][:, mid[:, 0], mid[:, 1]].t()  # [num_edges, C]
             if edge_index.shape[1] > 0:
                 out_gc, _ = self.graph_branch(node_features, edge_index, edge_attr)
@@ -221,17 +382,18 @@ class GraphHoverNet(nn.Module):
     def print_model_stats(self):
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
+
         def count_params(module):
             return sum(p.numel() for p in module.parameters())
-    
+
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Shared encoder parameters: {count_params(self.shared_encoder):,}")
-        print(f"NP head parameters (excluding encoder): {count_params(self.model_np.decoder) + count_params(self.model_np.segmentation_head):,}")
-        print(f"HV head parameters (excluding encoder): {count_params(self.model_hv.decoder) + count_params(self.model_hv.segmentation_head):,}")
-        print(f"NC head parameters (excluding encoder): {count_params(self.model_nc.decoder) + count_params(self.model_nc.segmentation_head):,}")
-        print(f"Graph branch parameters: {count_params(self.graph_branch):,}")
+        print(f"ViT encoder parameters: {count_params(self.encoder):,}")
+        print(f"NP UNet head parameters: {count_params(self.head_np):,}")
+        print(f"HV UNet head parameters: {count_params(self.head_hv):,}")
+        print(f"NC UNet head parameters: {count_params(self.head_nc):,}")
+        if hasattr(self, 'graph_branch'):
+            print(f"Graph branch parameters: {count_params(self.graph_branch):,}")
 
 if __name__ == "__main__":
     from config import Config
