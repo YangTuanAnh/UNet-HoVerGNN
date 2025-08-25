@@ -324,10 +324,13 @@ class UNetSegHead(nn.Module):
 
 class GraphHoverNet(nn.Module):
     def __init__(self, num_classes=6, use_graph=True, k_neighbors=8,
-                 use_sam_encoder: bool = False, sam_model_type: str = 'vit_b', sam_checkpoint: str | None = None):
+                 use_sam_encoder: bool = False, sam_model_type: str = 'vit_b', sam_checkpoint: str | None = None,
+                 graph_knn_backend: str = 'torch', use_amp: bool = False):
         super().__init__()
         self.use_graph = use_graph
         self.k_neighbors = k_neighbors
+        self.graph_knn_backend = graph_knn_backend  # 'torch' or 'sklearn'
+        self.use_amp = use_amp
 
         # Encoder choice: SAM-based ViT or local ViTEncoder
         if use_sam_encoder:
@@ -401,7 +404,39 @@ class GraphHoverNet(nn.Module):
     def build_graph(self, centroids, features):
         if centroids.shape[0] == 0:
             return torch.empty(2, 0).long().to(centroids.device)
-        centroids_np = centroids.cpu().numpy()
+        if self.graph_knn_backend == 'torch':
+            return self._build_graph_torch(centroids)
+        else:
+            return self._build_graph_sklearn(centroids)
+
+    def _build_graph_torch(self, centroids: torch.Tensor) -> torch.Tensor:
+        # centroids: [N, 2] on device
+        N = centroids.shape[0]
+        device = centroids.device
+        if N <= self.k_neighbors:
+            if N < 2:
+                return torch.empty(2, 0, device=device, dtype=torch.long)
+            idx_i, idx_j = torch.triu_indices(N, N, offset=1, device=device)
+            edges = torch.stack([torch.cat([idx_i, idx_j], dim=0), torch.cat([idx_j, idx_i], dim=0)], dim=0)
+            return edges.long()
+        # Compute pairwise distances (squared euclidean) and take top-k
+        coords = centroids.float()
+        dists = torch.cdist(coords, coords, p=2)
+        # Exclude self by setting large value on diagonal
+        diag_idx = torch.arange(N, device=device)
+        dists[diag_idx, diag_idx] = float('inf')
+        k = min(self.k_neighbors, N - 1)
+        knn_dists, knn_idx = torch.topk(dists, k=k, dim=1, largest=False)
+        src = torch.arange(N, device=device).unsqueeze(1).expand(-1, k).reshape(-1)
+        dst = knn_idx.reshape(-1)
+        edges = torch.stack([src, dst], dim=0)
+        # Make undirected by adding reverse edges (already included by construction, but ensure symmetry)
+        edges_rev = torch.stack([edges[1], edges[0]], dim=0)
+        edge_index = torch.cat([edges, edges_rev], dim=1)
+        return edge_index.long()
+
+    def _build_graph_sklearn(self, centroids: torch.Tensor) -> torch.Tensor:
+        centroids_np = centroids.detach().cpu().numpy()
         if centroids_np.shape[0] <= self.k_neighbors:
             n = centroids_np.shape[0]
             edges = []
@@ -425,14 +460,16 @@ class GraphHoverNet(nn.Module):
     def forward(self, x):
         batch_size = x.shape[0]
 
-        # Run ViT encoder once
-        encoder_feats = self.encoder(x)
-        feat = encoder_feats[self.feature_stage_index]  # [B, C, Hf, Wf]
+        amp_ctx = torch.cuda.amp.autocast if (self.use_amp and x.is_cuda) else torch.cpu.amp.autocast
+        with amp_ctx(enabled=self.use_amp):
+            # Run ViT encoder once
+            encoder_feats = self.encoder(x)
+            feat = encoder_feats[self.feature_stage_index]  # [B, C, Hf, Wf]
 
-        # CNN UNet-style decoder heads
-        out_np = self.head_np(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
-        out_hv = self.head_hv(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
-        out_nc = self.head_nc(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
+            # CNN UNet-style decoder heads
+            out_np = self.head_np(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
+            out_hv = self.head_hv(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
+            out_nc = self.head_nc(encoder_feats, input_spatial_size=(x.shape[2], x.shape[3]))
 
         if not self.use_graph:
             return out_np, out_hv, out_nc, None, None
