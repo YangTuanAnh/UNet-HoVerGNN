@@ -5,7 +5,7 @@ import segmentation_models_pytorch as smp
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
 
-from torch_geometric.nn import GENConv, LayerNorm, Linear
+from torch_geometric.nn import GATv2Conv, LayerNorm, Linear
 
 def get_sinusoidal_encoding(coords, num_freqs=64):
     """
@@ -28,21 +28,22 @@ def get_sinusoidal_encoding(coords, num_freqs=64):
     return torch.cat([sin_cos_y, sin_cos_x], dim=1)  # [N, 4 * num_freqs]
 
 class GraphBranch(nn.Module):
-    """Node-level GNN classifier using 3-layer GENConv with edge_attr"""
+    """Node-level GNN classifier using multi-layer GATv2 with edge_attr support."""
     def __init__(self, in_channels=512, hidden_channels=128, edge_dim=256, num_layers=3, num_classes=5, dropout=0.1):
         super().__init__()
 
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
-        self.convs.append(GENConv(in_channels, hidden_channels, edge_dim=edge_dim))
+        # Use single-head GATv2Conv layers to preserve channel sizes and support edge_attr
+        self.convs.append(GATv2Conv(in_channels, hidden_channels, heads=1, concat=True, edge_dim=edge_dim))
         self.norms.append(LayerNorm(hidden_channels))
 
         for _ in range(num_layers - 2):
-            self.convs.append(GENConv(hidden_channels, hidden_channels, edge_dim=edge_dim))
+            self.convs.append(GATv2Conv(hidden_channels, hidden_channels, heads=1, concat=True, edge_dim=edge_dim))
             self.norms.append(LayerNorm(hidden_channels))
 
-        self.convs.append(GENConv(hidden_channels, hidden_channels, edge_dim=edge_dim))
+        self.convs.append(GATv2Conv(hidden_channels, hidden_channels, heads=1, concat=True, edge_dim=edge_dim))
         self.norms.append(LayerNorm(hidden_channels))
 
         self.classifier = nn.Sequential(
@@ -60,7 +61,7 @@ class GraphBranch(nn.Module):
         x = self.norms[0](x)
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
-        
+
         for i in range(1, len(self.convs) - 1):
             residual = x
             x = self.convs[i](x, edge_index, edge_attr)
