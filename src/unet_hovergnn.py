@@ -6,6 +6,13 @@ import numpy as np
 
 from torch_geometric.nn import GATv2Conv, LayerNorm, Linear
 
+# Optional SAM import
+try:
+    from segment_anything import sam_model_registry  # type: ignore
+    _HAS_SAM = True
+except Exception:
+    _HAS_SAM = False
+
 def get_sinusoidal_encoding(coords, num_freqs=64):
     """
     coords: (N, 2) integer tensor with (y, x) positions
@@ -137,6 +144,95 @@ class ViTEncoder(nn.Module):
             feats.append(cur)
         return feats
 
+class SAMViTEncoder(nn.Module):
+    """
+    Wraps SAM's image encoder to provide a 4-level feature pyramid for UNet decoders.
+    - Loads SAM ViT (vit_b/l/h) from checkpoint via segment_anything
+    - Produces [x0, s1, s2, s3, s4] where s1 is the SAM image embedding, and s2..s4 are
+      progressively downsampled via strided convs.
+    """
+    def __init__(self, sam_model_type: str = 'vit_b', sam_checkpoint: str | None = None,
+                 out_channels: list[int] | None = None, normalize: bool = True):
+        super().__init__()
+        assert _HAS_SAM, "segment_anything is not installed. Install it or disable SAM encoder."
+        assert sam_checkpoint is not None and len(sam_checkpoint) > 0, "sam_checkpoint path must be provided."
+        self.normalize = normalize
+        self.sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
+        # Expect SAM image_encoder attribute
+        self.image_encoder = self.sam.image_encoder
+
+        # Default output channels to match our decoders
+        if out_channels is None:
+            # [input, s1, s2, s3, s4]
+            out_channels = [3, 128, 192, 256, 256]
+        assert len(out_channels) == 5
+        self.out_channels = out_channels
+
+        # Project SAM embedding channels to our s1 channels if needed
+        # Infer SAM embed dim by a dummy spec (can't run here), so define a lazy conv after first forward
+        self.s1_proj: nn.Module | None = None
+
+        # Downsampling towers to create s2..s4
+        c1, c2, c3, c4 = out_channels[1], out_channels[2], out_channels[3], out_channels[4]
+        self.down2 = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(c2),
+            nn.GELU(),
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(c3),
+            nn.GELU(),
+        )
+        self.down4 = nn.Sequential(
+            nn.Conv2d(c3, c4, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(c4),
+            nn.GELU(),
+        )
+
+        # SAM normalization parameters (from official repo)
+        self.register_buffer('pixel_mean', torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1) / 255.0, persistent=False)
+        self.register_buffer('pixel_std', torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1) / 255.0, persistent=False)
+
+    @staticmethod
+    def _to_multiple_of_16(h: int, w: int) -> tuple[int, int]:
+        import math
+        return int(math.ceil(h / 16) * 16), int(math.ceil(w / 16) * 16)
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        B, C, H, W = x.shape
+        feats: list[torch.Tensor] = [x]
+
+        # Prepare input for SAM: resize to multiple of 16 and normalize
+        Hs, Ws = self._to_multiple_of_16(H, W)
+        x_resized = x
+        if (Hs != H) or (Ws != W):
+            x_resized = F.interpolate(x_resized, size=(Hs, Ws), mode='bilinear', align_corners=False)
+        if self.normalize:
+            x_resized = (x_resized - self.pixel_mean) / self.pixel_std
+
+        # SAM image encoder forward: returns [B, Cs, Hs/16, Ws/16]
+        with torch.no_grad():
+            sam_feat = self.image_encoder(x_resized)
+
+        # Project to s1 channels if needed
+        target_c1 = self.out_channels[1]
+        if self.s1_proj is None:
+            in_c = sam_feat.shape[1]
+            if in_c != target_c1:
+                self.s1_proj = nn.Conv2d(in_c, target_c1, kernel_size=1)
+            else:
+                self.s1_proj = nn.Identity()
+        s1 = self.s1_proj(sam_feat)
+
+        # Build pyramid s2..s4
+        s2 = self.down2(s1)
+        s3 = self.down3(s2)
+        s4 = self.down4(s3)
+
+        feats.extend([s1, s2, s3, s4])
+        return feats
+
 class UNetSegHead(nn.Module):
     """
     CNN-based UNet decoder head that consumes encoder pyramid [input, s1..s4].
@@ -227,13 +323,19 @@ class UNetSegHead(nn.Module):
         return logits
 
 class GraphHoverNet(nn.Module):
-    def __init__(self, num_classes=6, use_graph=True, k_neighbors=8):
+    def __init__(self, num_classes=6, use_graph=True, k_neighbors=8,
+                 use_sam_encoder: bool = False, sam_model_type: str = 'vit_b', sam_checkpoint: str | None = None):
         super().__init__()
         self.use_graph = use_graph
         self.k_neighbors = k_neighbors
 
-        # Shared ViT encoder (4 stages)
-        self.encoder = ViTEncoder(in_channels=3)
+        # Encoder choice: SAM-based ViT or local ViTEncoder
+        if use_sam_encoder:
+            assert _HAS_SAM, "segment_anything is not available. Install it or set use_sam_encoder=False."
+            assert sam_checkpoint is not None and len(sam_checkpoint) > 0, "Provide sam_checkpoint when use_sam_encoder=True."
+            self.encoder = SAMViTEncoder(sam_model_type=sam_model_type, sam_checkpoint=sam_checkpoint)
+        else:
+            self.encoder = ViTEncoder(in_channels=3)
         self.encoder_channels = list(self.encoder.out_channels)
 
         # Graph uses the -2 stage (s3)
