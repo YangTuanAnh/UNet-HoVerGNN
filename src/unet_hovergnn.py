@@ -202,7 +202,8 @@ class GraphHoverNet(nn.Module):
                     ny = yy + dy
                     nx = xx + dx
                     mask = (ny >= 0) & (ny < G) & (nx >= 0) & (nx < G)
-                    src = base_idx[mask]
+                    mask_flat = mask.reshape(-1)
+                    src = base_idx[mask_flat]
                     dst = (ny[mask] * G + nx[mask]).reshape(-1)
                     if src.numel() > 0:
                         edges.append(torch.stack([src, dst], dim=0))
