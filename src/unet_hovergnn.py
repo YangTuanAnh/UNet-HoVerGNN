@@ -77,10 +77,13 @@ class GraphBranch(nn.Module):
 
 class GraphHoverNet(nn.Module):
     def __init__(self, num_classes=6, encoder_name='resnet34', encoder_weights='imagenet', 
-                 use_graph=True, k_neighbors=8, graph_feature_dim=288):
+                 use_graph=True, k_neighbors=8, graph_feature_dim=288,
+                 use_vig: bool = True, vig_grid_size: int = 32):
         super().__init__()
         self.use_graph = use_graph
         self.k_neighbors = k_neighbors
+        self.use_vig = use_vig
+        self.vig_grid_size = vig_grid_size
 
         # Shared encoder
         self.shared_encoder = smp.encoders.get_encoder(encoder_name, in_channels=3, depth=5, weights=encoder_weights)
@@ -175,48 +178,108 @@ class GraphHoverNet(nn.Module):
         out_gc = None
         graph_enhanced_nc = out_nc.clone()
         encoder_feats = self.shared_encoder(x)
-        encoder_features = F.interpolate(encoder_feats[-2], size=(255, 255), mode="bilinear", align_corners=False)
 
-        all_centroids = []
-        all_out_gc = []
-        
-        for b in range(batch_size):
-            centroids = self.extract_nucleus_centroids(out_np[b:b+1], out_hv[b:b+1], threshold=0.3)[0]
-            if centroids.shape[0] == 0:
-                continue
-            h, w = encoder_features.shape[2], encoder_features.shape[3]
-            centroid_coords = centroids.long()
-            centroid_coords[:, 0] = torch.clamp(centroid_coords[:, 0], 0, h - 1)
-            centroid_coords[:, 1] = torch.clamp(centroid_coords[:, 1], 0, w - 1)
-            node_feats = encoder_features[b, :, centroid_coords[:, 0], centroid_coords[:, 1]].t()
-            
-            # Generate sinusoidal positional encodings
-            pos_enc = get_sinusoidal_encoding(centroid_coords, num_freqs=8)  # [N, 32]
-            
-            # Concatenate encoder + positional features
-            node_features = torch.cat([node_feats, pos_enc], dim=1)  # [N, C + 32]
+        if self.use_vig:
+            # Build Visual Interaction Graph (ViG) on a fixed grid from encoder features
+            C = encoder_feats[-2].shape[1]
+            G = self.vig_grid_size
+            small_feats = F.interpolate(encoder_feats[-2], size=(G, G), mode="bilinear", align_corners=False)
 
-            edge_index = self.build_graph(centroids, node_features)
+            all_coords = []
+            all_out_gc = []
 
-            mid = ((centroid_coords[edge_index[0]] + centroid_coords[edge_index[1]]) / 2).long()
-            mid[:, 0] = mid[:, 0].clamp(0, 254)
-            mid[:, 1] = mid[:, 1].clamp(0, 254)
-            
-            # Edge attributes from midpoints
-            edge_attr = encoder_features[b][:, mid[:, 0], mid[:, 1]].t()  # [num_edges, C]
-            if edge_index.shape[1] > 0:
-                out_gc, _ = self.graph_branch(node_features, edge_index, edge_attr)
-                all_centroids.append(torch.cat([centroid_coords, torch.full((centroid_coords.shape[0], 1), b, device=x.device)], dim=1))  # (N, 3): (y, x, batch_id)
-                all_out_gc.append(out_gc)
+            yy, xx = torch.meshgrid(torch.arange(G, device=x.device), torch.arange(G, device=x.device), indexing='ij')
+            grid_coords = torch.stack([yy.reshape(-1), xx.reshape(-1)], dim=1)  # [N, 2]
+            Nn = grid_coords.shape[0]
 
-        if all_centroids:
-            centroid_coords = torch.cat(all_centroids, dim=0)  # (sum(N), 3)
-            out_gc = torch.cat(all_out_gc, dim=0)              # (sum(N), C)
+            # Precompute 8-neighborhood edges on grid
+            base_idx = (yy * G + xx).reshape(-1)
+            edges = []
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny = yy + dy
+                    nx = xx + dx
+                    mask = (ny >= 0) & (ny < G) & (nx >= 0) & (nx < G)
+                    src = base_idx[mask]
+                    dst = (ny[mask] * G + nx[mask]).reshape(-1)
+                    if src.numel() > 0:
+                        edges.append(torch.stack([src, dst], dim=0))
+            if len(edges) > 0:
+                edge_index_template = torch.cat(edges, dim=1)
+            else:
+                edge_index_template = torch.empty(2, 0, device=x.device, dtype=torch.long)
+
+            for b in range(batch_size):
+                node_feats_enc = small_feats[b].permute(1, 2, 0).reshape(Nn, C)  # [N, C]
+                pos_enc = get_sinusoidal_encoding(grid_coords, num_freqs=8)  # [N, 32]
+                node_features = torch.cat([node_feats_enc, pos_enc], dim=1)  # [N, C+32]
+
+                edge_index = edge_index_template
+                if edge_index.shape[1] == 0:
+                    continue
+                mid = ((grid_coords[edge_index[0]] + grid_coords[edge_index[1]]) // 2).long()
+                mid[:, 0] = mid[:, 0].clamp(0, G - 1)
+                mid[:, 1] = mid[:, 1].clamp(0, G - 1)
+                edge_attr = small_feats[b][:, mid[:, 0], mid[:, 1]].t()  # [E, C]
+
+                out_gc_b, _ = self.graph_branch(node_features, edge_index, edge_attr)
+                all_coords.append(torch.cat([grid_coords, torch.full((Nn, 1), b, device=x.device)], dim=1))
+                all_out_gc.append(out_gc_b)
+
+            if all_coords:
+                centroid_coords = torch.cat(all_coords, dim=0)
+                out_gc = torch.cat(all_out_gc, dim=0)
+            else:
+                centroid_coords = torch.empty(0, 3, device=x.device)
+                out_gc = None
+
+            return out_np, out_hv, out_nc, centroid_coords, out_gc
         else:
-            centroid_coords = torch.empty(0, 3, device=x.device)
-            out_gc = None
+            # Original nucleus-centroid graph
+            encoder_features = F.interpolate(encoder_feats[-2], size=(255, 255), mode="bilinear", align_corners=False)
 
-        return out_np, out_hv, out_nc, centroid_coords, out_gc
+            all_centroids = []
+            all_out_gc = []
+            
+            for b in range(batch_size):
+                centroids = self.extract_nucleus_centroids(out_np[b:b+1], out_hv[b:b+1], threshold=0.3)[0]
+                if centroids.shape[0] == 0:
+                    continue
+                h, w = encoder_features.shape[2], encoder_features.shape[3]
+                centroid_coords = centroids.long()
+                centroid_coords[:, 0] = torch.clamp(centroid_coords[:, 0], 0, h - 1)
+                centroid_coords[:, 1] = torch.clamp(centroid_coords[:, 1], 0, w - 1)
+                node_feats = encoder_features[b, :, centroid_coords[:, 0], centroid_coords[:, 1]].t()
+                
+                # Generate sinusoidal positional encodings
+                pos_enc = get_sinusoidal_encoding(centroid_coords, num_freqs=8)  # [N, 32]
+                
+                # Concatenate encoder + positional features
+                node_features = torch.cat([node_feats, pos_enc], dim=1)  # [N, C + 32]
+
+                edge_index = self.build_graph(centroids, node_features)
+
+                mid = ((centroid_coords[edge_index[0]] + centroid_coords[edge_index[1]]) / 2).long()
+                mid[:, 0] = mid[:, 0].clamp(0, 254)
+                mid[:, 1] = mid[:, 1].clamp(0, 254)
+                
+                # Edge attributes from midpoints
+                edge_attr = encoder_features[b][:, mid[:, 0], mid[:, 1]].t()  # [num_edges, C]
+                if edge_index.shape[1] > 0:
+                    out_gc, _ = self.graph_branch(node_features, edge_index, edge_attr)
+                    all_centroids.append(torch.cat([centroid_coords, torch.full((centroid_coords.shape[0], 1), b, device=x.device)], dim=1))  # (N, 3): (y, x, batch_id)
+                    all_out_gc.append(out_gc)
+
+            if all_centroids:
+                centroid_coords = torch.cat(all_centroids, dim=0)  # (sum(N), 3)
+                out_gc = torch.cat(all_out_gc, dim=0)              # (sum(N), C)
+            else:
+                centroid_coords = torch.empty(0, 3, device=x.device)
+                out_gc = None
+
+            return out_np, out_hv, out_nc, centroid_coords, out_gc
 
     def print_model_stats(self):
         total_params = sum(p.numel() for p in self.parameters())
