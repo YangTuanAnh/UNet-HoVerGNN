@@ -69,3 +69,21 @@ python main.py --dataset CoNSeP_Tiled --num_classes 8 \
 | **Ours (Pretrain)** |       0.230 |     0.271 |     0.248 |   **0.653** | **0.695** | **0.672** |      0.484 |     0.498 |     0.490 |
 | **Ours (Finetune)** |   **0.603** | **0.641** |     0.622 |       0.644 |     0.682 |     0.661 |  **0.585** | **0.608** | **0.595** |
 
+
+## Citation
+```
+@inproceedings{10.1117/12.3094417,
+author = {Tuan-Anh Yang and Hai-Dang Nguyen and Ngoc-Thao Nguyen},
+title = {{UNet-HoVerGNN: structured graph integration into HoVerNet for enhanced nuclei segmentation and classification}},
+volume = {14114},
+booktitle = {Eighteenth International Conference on Machine Vision (ICMV 2025)},
+editor = {Wolfgang Osten and Eden Mamut},
+organization = {International Society for Optics and Photonics},
+publisher = {SPIE},
+pages = {141140Q},
+keywords = {nuclear segmentation, nuclear classification, computational pathology, deep learning, graph neural networks},
+year = {2026},
+doi = {10.1117/12.3094417},
+URL = {https://doi.org/10.1117/12.3094417}
+}
+```
